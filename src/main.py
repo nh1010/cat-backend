@@ -1,7 +1,9 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import os
 from dotenv import load_dotenv
 from datetime import datetime
@@ -9,22 +11,43 @@ from datetime import datetime
 from .database import Base, engine, get_db
 from .models import CatSighting as CatSightingModel
 from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy import text as sql_text
+import io
+import csv
+import uuid
+import pathlib
 
 load_dotenv()
 
 # Create tables if they don't exist (simple start; migrations recommended later)
 Base.metadata.create_all(bind=engine)
+# Lightweight migration: ensure spotted_at column exists
+try:
+    with engine.begin() as conn:
+        conn.execute(sql_text("ALTER TABLE cat_sightings ADD COLUMN IF NOT EXISTS spotted_at TIMESTAMPTZ"))
+except Exception:
+    # Best-effort; avoid crashing app if migration fails in a non-Postgres env
+    pass
 
 app = FastAPI(title="NYC Cat Tracker API")
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Frontend URL
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Static uploads directory
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 # Pydantic models for request/response
 class CatSightingCreate(BaseModel):
@@ -35,6 +58,7 @@ class CatSightingCreate(BaseModel):
     cat_name: Optional[str] = None
     image_url: Optional[str] = None
     source: Optional[str] = "map"
+    spotted_at: Optional[datetime] = None
 
 class CatSightingResponse(BaseModel):
     id: int
@@ -45,11 +69,19 @@ class CatSightingResponse(BaseModel):
     cat_name: Optional[str] = None
     image_url: Optional[str] = None
     source: str
+    spotted_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
 
     class Config:
         from_attributes = True
+
+class ReportsSummaryResponse(BaseModel):
+    total: int
+    by_source: Dict[str, int]
+    per_day: List[Dict[str, Any]]
+    start: datetime
+    end: datetime
 
 @app.get("/")
 def read_root():
@@ -70,6 +102,7 @@ def create_cat_sighting(sighting: CatSightingCreate, db: Session = Depends(get_d
         cat_name=sighting.cat_name,
         image_url=sighting.image_url,
         source=sighting.source or "map",
+        spotted_at=sighting.spotted_at,
     )
     db.add(row)
     db.commit()
@@ -82,6 +115,154 @@ def get_cat_sighting(sighting_id: int, db: Session = Depends(get_db)):
     if not row:
         raise HTTPException(status_code=404, detail="Cat sighting not found")
     return row
+
+@app.post("/api/upload")
+async def upload_image(file: UploadFile = File(...)):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are allowed")
+    ext = pathlib.Path(file.filename or "").suffix.lower()
+    # Basic extension allowlist (optional)
+    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+        ext = ".jpg"
+    name = f"{uuid.uuid4().hex}{ext}"
+    dest_path = pathlib.Path(UPLOAD_DIR) / name
+    try:
+        with dest_path.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+    finally:
+        await file.aclose()
+    return {"url": f"/uploads/{name}"}
+
+def _parse_date_range(start: Optional[str], end: Optional[str]) -> (datetime, datetime):
+    """Parse ISO date strings (YYYY-MM-DD) into inclusive datetime bounds in local time.
+    If missing, default to last 30 days.
+    """
+    now = datetime.now()
+    if not end:
+        end_dt = now
+    else:
+        # end of day
+        end_dt = datetime.fromisoformat(end)
+        end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if not start:
+        start_dt = datetime.fromtimestamp(end_dt.timestamp() - 29 * 24 * 3600)
+    else:
+        start_dt = datetime.fromisoformat(start)
+        start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_dt, end_dt
+
+@app.get("/api/reports/summary", response_model=ReportsSummaryResponse)
+def get_reports_summary(
+    start: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+):
+    start_dt, end_dt = _parse_date_range(start, end)
+
+    base_q = db.query(CatSightingModel).filter(
+        CatSightingModel.created_at >= start_dt,
+        CatSightingModel.created_at <= end_dt,
+    )
+
+    total = base_q.count()
+
+    # by source
+    src_rows = (
+        db.query(CatSightingModel.source, func.count(CatSightingModel.id))
+        .filter(
+            CatSightingModel.created_at >= start_dt,
+            CatSightingModel.created_at <= end_dt,
+        )
+        .group_by(CatSightingModel.source)
+        .all()
+    )
+    by_source: Dict[str, int] = {s or "unknown": c for s, c in src_rows}
+
+    # per day counts (using date(created_at))
+    day_rows = (
+        db.query(func.date(CatSightingModel.created_at), func.count(CatSightingModel.id))
+        .filter(
+            CatSightingModel.created_at >= start_dt,
+            CatSightingModel.created_at <= end_dt,
+        )
+        .group_by(func.date(CatSightingModel.created_at))
+        .order_by(func.date(CatSightingModel.created_at))
+        .all()
+    )
+    per_day = [
+        {"date": str(d), "count": count}
+        for d, count in day_rows
+    ]
+
+    return ReportsSummaryResponse(
+        total=total,
+        by_source=by_source,
+        per_day=per_day,
+        start=start_dt,
+        end=end_dt,
+    )
+
+@app.get("/api/reports/export")
+def export_reports_csv(
+    start: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+):
+    start_dt, end_dt = _parse_date_range(start, end)
+
+    rows: List[CatSightingModel] = (
+        db.query(CatSightingModel)
+        .filter(
+            CatSightingModel.created_at >= start_dt,
+            CatSightingModel.created_at <= end_dt,
+        )
+        .order_by(CatSightingModel.created_at.desc())
+        .all()
+    )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id",
+        "lat",
+        "lng",
+        "address",
+        "description",
+        "cat_name",
+        "image_url",
+        "source",
+        "spotted_at",
+        "created_at",
+        "updated_at",
+    ])
+    for r in rows:
+        writer.writerow([
+            r.id,
+            r.lat,
+            r.lng,
+            r.address or "",
+            r.description or "",
+            r.cat_name or "",
+            r.image_url or "",
+            r.source,
+            r.spotted_at.isoformat() if getattr(r, "spotted_at", None) else "",
+            r.created_at.isoformat() if r.created_at else "",
+            r.updated_at.isoformat() if r.updated_at else "",
+        ])
+
+    output.seek(0)
+    filename = f"cat_sightings_{start_dt.date()}_to_{end_dt.date()}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+        },
+    )
 
 if __name__ == "__main__":
     import uvicorn

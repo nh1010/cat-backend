@@ -13,6 +13,7 @@ class CatSighting(Base):
     cat_name = Column(String, nullable=True)
     image_url = Column(String, nullable=True)
     source = Column(String, nullable=False, default="map")  # 'map' | 'address'
+    spotted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
