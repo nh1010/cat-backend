@@ -2,11 +2,11 @@ from fastapi import FastAPI, HTTPException, Depends, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Optional, Dict, Any
 import os
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, date, timezone
 
 from .database import Base, engine, get_db
 from .models import CatSighting as CatSightingModel
@@ -59,6 +59,41 @@ class CatSightingCreate(BaseModel):
     image_url: Optional[str] = None
     source: Optional[str] = "map"
     spotted_at: Optional[datetime] = None
+
+    @field_validator("spotted_at", mode="before")
+    @classmethod
+    def _parse_spotted_at(cls, v: Optional[object]) -> Optional[datetime]:
+        if v is None:
+            return None
+        if isinstance(v, datetime):
+            # Ensure timezone-aware; default to UTC if naive
+            return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
+        if isinstance(v, (int, float)):
+            # Treat as unix seconds
+            try:
+                return datetime.fromtimestamp(float(v), tz=timezone.utc)
+            except Exception:
+                return None
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            # Handle trailing Z (UTC)
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            # Try full datetime first
+            try:
+                dt = datetime.fromisoformat(s)
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                pass
+            # Try date-only: YYYY-MM-DD
+            try:
+                d = date.fromisoformat(s)
+                return datetime(d.year, d.month, d.day, 12, 0, tzinfo=timezone.utc)
+            except Exception:
+                return None
+        return None
 
 class CatSightingResponse(BaseModel):
     id: int
