@@ -10,7 +10,7 @@ services:
     volumes:
       - dbdata:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5433:5432"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "catuser", "-d", "catdb"]
       interval: 5s
@@ -18,19 +18,19 @@ services:
       retries: 10
 
   api:
-    build: .
+    build:
+      context: .
+      target: dev
     container_name: catapi
     depends_on:
       db:
         condition: service_healthy
-    # When using local Postgres, start the db profile: `docker compose --profile local up`
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg2://catuser:catpass@db:5432/catdb}
-      DB_USER: ${DB_USER:-catuser}
-      DB_PASSWORD: ${DB_PASSWORD:-catpass}
-      DB_HOST: ${DB_HOST:-db}
-      DB_PORT: ${DB_PORT:-5432}
-      DB_NAME: ${DB_NAME:-catdb}
+      DB_USER: catuser
+      DB_PASSWORD: catpass
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: catdb
       PORT: 5000
       PYTHONUNBUFFERED: "1"
       UPLOAD_DIR: /app/uploads
@@ -39,6 +39,18 @@ services:
     volumes:
       - ./uploads:/app/uploads
     command: ["python", "main.py"]
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: cat-pgadmin
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: adminpass
+    ports:
+      - "5051:80"
 
 volumes:
   dbdata:

@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException, Depends, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, Query, UploadFile, File, Request
+import logging
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field, AliasChoices
 from typing import List, Optional, Dict, Any
 import os
 from dotenv import load_dotenv
@@ -31,6 +32,8 @@ except Exception:
     pass
 
 app = FastAPI(title="NYC Cat Tracker API")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("cat-api")
 
 # CORS middleware
 app.add_middleware(
@@ -55,10 +58,11 @@ class CatSightingCreate(BaseModel):
     lng: float
     address: Optional[str] = None
     description: Optional[str] = None
-    cat_name: Optional[str] = None
-    image_url: Optional[str] = None
+    # Accept both snake_case and camelCase
+    cat_name: Optional[str] = Field(default=None, validation_alias=AliasChoices("cat_name", "catName"))
+    image_url: Optional[str] = Field(default=None, validation_alias=AliasChoices("image_url", "imageUrl"))
     source: Optional[str] = "map"
-    spotted_at: Optional[datetime] = None
+    spotted_at: Optional[datetime] = Field(default=None, validation_alias=AliasChoices("spotted_at", "spottedAt"))
 
     @field_validator("spotted_at", mode="before")
     @classmethod
@@ -128,20 +132,42 @@ def get_cat_sightings(db: Session = Depends(get_db)):
     return rows
 
 @app.post("/api/cats", response_model=CatSightingResponse, status_code=201)
-def create_cat_sighting(sighting: CatSightingCreate, db: Session = Depends(get_db)):
+async def create_cat_sighting(sighting: CatSightingCreate, request: Request, db: Session = Depends(get_db)):
+    # Default spotted_at to now if omitted
+    spotted_at = sighting.spotted_at or datetime.now(timezone.utc)
+    # Prefer explicit body keys as a last resort to capture any naming variations
+    try:
+        raw = await request.json()
+    except Exception:
+        raw = {}
+    # Try multiple variants for cat name
+    cat_name_val = sighting.cat_name or raw.get("cat_name") or raw.get("catName")
+    if cat_name_val is None and isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                nk = str(k).replace("_", "").lower()
+            except Exception:
+                continue
+            if nk == "catname" or nk.endswith("catname"):
+                cat_name_val = v
+                break
+
+    logger.info("POST /api/cats body=%s parsed.cat_name=%s chosen=%s", raw, sighting.cat_name, cat_name_val)
+
     row = CatSightingModel(
         lat=sighting.lat,
         lng=sighting.lng,
         address=sighting.address,
         description=sighting.description,
-        cat_name=sighting.cat_name,
+        cat_name=cat_name_val,
         image_url=sighting.image_url,
         source=sighting.source or "map",
-        spotted_at=sighting.spotted_at,
+        spotted_at=spotted_at,
     )
     db.add(row)
     db.commit()
     db.refresh(row)
+    logger.info("Saved sighting id=%s cat_name=%s desc=%s", row.id, row.cat_name, row.description)
     return row
 
 @app.get("/api/cats/{sighting_id}", response_model=CatSightingResponse)
