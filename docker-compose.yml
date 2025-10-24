@@ -34,9 +34,17 @@ services:
       PORT: 5000
       PYTHONUNBUFFERED: "1"
       UPLOAD_DIR: /app/uploads
+      # S3 Configuration (optional - falls back to local storage if not set)
+      AWS_REGION: ${AWS_REGION:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-10}
     ports:
       - "5050:5000"
     volumes:
+      - ./src:/app/src
+      - ./main.py:/app/main.py
       - ./uploads:/app/uploads
     command: ["python", "main.py"]
 

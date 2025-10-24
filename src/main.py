@@ -152,8 +152,6 @@ async def create_cat_sighting(sighting: CatSightingCreate, request: Request, db:
                 cat_name_val = v
                 break
 
-    logger.info("POST /api/cats body=%s parsed.cat_name=%s chosen=%s", raw, sighting.cat_name, cat_name_val)
-
     row = CatSightingModel(
         lat=sighting.lat,
         lng=sighting.lng,
@@ -167,8 +165,18 @@ async def create_cat_sighting(sighting: CatSightingCreate, request: Request, db:
     db.add(row)
     db.commit()
     db.refresh(row)
-    logger.info("Saved sighting id=%s cat_name=%s desc=%s", row.id, row.cat_name, row.description)
     return row
+
+@app.get("/api/cats/recent-with-images", response_model=List[CatSightingResponse])
+def get_recent_cats_with_images(db: Session = Depends(get_db)):
+    rows = (
+        db.query(CatSightingModel)
+        .filter(CatSightingModel.image_url.isnot(None))
+        .order_by(CatSightingModel.created_at.desc())
+        .limit(10)
+        .all()
+    )
+    return rows
 
 @app.get("/api/cats/{sighting_id}", response_model=CatSightingResponse)
 def get_cat_sighting(sighting_id: int, db: Session = Depends(get_db)):
